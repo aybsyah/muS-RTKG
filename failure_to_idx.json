@@ -1,0 +1,7 @@
+{
+  "normal": 0,
+  "cpu": 1,
+  "mem": 2,
+  "net_delay": 3,
+  "net_loss": 4
+}

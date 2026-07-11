@@ -1,0 +1,16 @@
+{
+  "normal": 0,
+  "adservice": 1,
+  "cartservice": 2,
+  "checkoutservice": 3,
+  "currencyservice": 4,
+  "emailservice": 5,
+  "frontend": 6,
+  "loadgenerator": 7,
+  "paymentservice": 8,
+  "productcatalogservice": 9,
+  "recommendationservice": 10,
+  "redis": 11,
+  "redis-cart": 12,
+  "shippingservice": 13
+}
