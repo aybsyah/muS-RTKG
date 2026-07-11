@@ -37,6 +37,8 @@ Le modèle final répond à deux questions :
 2. **Quel type de panne est en cours ?** (classification multi-classe `y2`)
 
 ---
+## Architecture du modèle
+
 
 Le modèle (`GATGRUMultiTask`, dans [`model.py`](./model.py)) s'articule en quatre blocs : encodage spatial par graphe (GATv2), agrégation en embedding de graphe, encodage temporel (BiGRU + attention), puis deux têtes de sortie dédiées.
  
