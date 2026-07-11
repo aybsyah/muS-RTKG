@@ -1,14 +1,3 @@
-service_name,service_index
-normal,0
-adservice,1
-cartservice,2
-checkoutservice,3
-currencyservice,4
-emailservice,5
-frontend,6
-loadgenerator,7
-paymentservice,8
-productcatalogservice,9
-recommendationservice,10
-redis-cart,11
-shippingservice,12
+version https://git-lfs.github.com/spec/v1
+oid sha256:01f11aa7ec16be3dd09e6d114061adef19ef3843c7855c96921ff62f5f81525d
+size 253
