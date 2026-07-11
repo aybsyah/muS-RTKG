@@ -18,8 +18,7 @@ Le modèle est multi-tâche : il produit simultanément une prédiction de **ser
 - [Évaluation et inférence](#évaluation-et-inférence)
 - [Artefacts produits](#artefacts-produits)
 - [Configuration et hyperparamètres](#configuration-et-hyperparamètres)
-- [Limitations connues](#limitations-connues)
-- [Feuille de route](#feuille-de-route)
+
 - [Licence](#licence)
 
 ---
@@ -232,13 +231,6 @@ Ce script recharge le modèle et les artefacts de prétraitement (scalers, mappi
 
 
 
-## Feuille de route
-
-- [ ] Ajout d'une validation croisée temporelle (rolling-origin) plutôt qu'un split fixe train/tester_model
-- [ ] Export ONNX / TorchScript pour le déploiement en inférence temps réel
-- [ ] Interface de visualisation des poids d'attention (spatiaux et temporels) pour l'explicabilité du RCA
-
----
 
 ## Licence
 
