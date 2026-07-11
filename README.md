@@ -38,33 +38,65 @@ Le modèle final répond à deux questions :
 
 ---
 
-## Architecture du modèle
-
-Le modèle (`GATGRUMultiTask`, dans [`model.py`](./model.py)) s'articule en quatre blocs :
-
-![Architecture](model_architecture_with_layers.png)
-
+Le modèle (`GATGRUMultiTask`, dans [`model.py`](./model.py)) s'articule en quatre blocs : encodage spatial par graphe (GATv2), agrégation en embedding de graphe, encodage temporel (BiGRU + attention), puis deux têtes de sortie dédiées.
+ 
+![Architecture du modèle µS-RTKG + RCA](model_architecture_with_layers.png)
+ 
+*Figure — Pipeline complet : les logs de communication, métriques de ressources et événements Kubernetes sont assemblés en une séquence temporelle de graphes (RTKG snapshots `G_t`), enrichis de features causales sur les nœuds/arêtes. Chaque graphe est encodé par un `GATv2` à 4 têtes d'attention, puis agrégé par pooling (mean ‖ max ‖ std) avant d'être passé à un `BiGRU`. Une couche d'attention temporelle résume la séquence, qui alimente enfin les deux têtes de sortie (`Service Head`, `Failure Type Head`).*
+ 
+Schéma synthétique des dimensions traversées (exemple avec `F_v = 17` features par nœud) :
+ 
+```
+input layer   →   GATv2 layers   →   BiGRU layer   →   attention layer   →   output heads
+ (F_v = 17)        (4 têtes)          (564)              (256)            ŷ1 : 14 | ŷ2 : 5
+```
+ 
+Détail séquentiel des blocs :
+ 
+```
+Séquence de graphes [G_t0, G_t1, ..., G_t(T-1)]
+        │
+        ▼
+┌───────────────────────┐
+│   GATEncoder (GATv2)  │  → encodage spatial par graphe (2 couches, résiduelles)
+│   + LayerNorm + ELU   │
+└───────────┬───────────┘
+            ▼
+   Pooling (mean ‖ max ‖ std)   → embedding de graphe par pas de temps
+            ▼
+┌───────────────────────┐
+│   GRU bidirectionnel  │  → encodage temporel de la séquence d'embeddings
+│   (2 couches)         │
+└───────────┬───────────┘
+            ▼
+  Dernier état ‖ Attention temporelle
+            ▼
+        Fusion (MLP)
+            ▼
+     ┌──────┴──────┐
+     ▼             ▼
+ Tête Service   Tête Panne
+ (MLPHead)      (MLPHead)
+```
+ 
 ### 1. `GATEncoder` — encodage spatial
 - Deux couches **GATv2Conv** (attention multi-têtes sur les arêtes, avec `edge_dim` pour intégrer les features de communication).
 - Connexions résiduelles + `LayerNorm` + `ELU` à chaque étage pour stabiliser l'entraînement sur des graphes de petite taille.
 - Une projection linéaire (`input_proj`) sert de raccourci résiduel dès la première couche.
-
 ### 2. Pooling multi-statistique
 Pour chaque graphe, l'embedding global est obtenu par concaténation de trois agrégations sur les nœuds :
 - **moyenne** (`global_mean_pool`)
 - **maximum** (`global_max_pool`)
 - **écart-type** (implémentation batchée maison via `index_add_`, sans boucle Python)
-
 Cela permet de capter à la fois la tendance générale et la dispersion des anomalies entre services.
-
+ 
 ### 3. Module temporel — GRU + attention
 - Un **GRU bidirectionnel à 2 couches** encode la séquence d'embeddings de graphes.
 - Un module **`TemporalAttentionPooling`** calcule une pondération softmax sur les pas de temps (attention additive de type Bahdanau) pour produire un résumé contextuel de la séquence.
 - Le dernier état caché et le résumé attentionnel sont concaténés puis fusionnés par un MLP.
-
 ### 4. Têtes de classification (`MLPHead`)
 Deux têtes indépendantes (service / panne), chacune un MLP à 2 couches cachées avec `LayerNorm`, `ReLU` et `Dropout`, partageant la même représentation fusionnée en entrée.
-
+ 
 ---
 
 ## Pipeline de données
