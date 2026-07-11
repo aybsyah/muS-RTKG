@@ -42,31 +42,7 @@ Le modèle final répond à deux questions :
 
 Le modèle (`GATGRUMultiTask`, dans [`model.py`](./model.py)) s'articule en quatre blocs :
 
-```
-Séquence de graphes [G_t0, G_t1, ..., G_t(T-1)]
-        │
-        ▼
-┌───────────────────────┐
-│   GATEncoder (GATv2)  │  → encodage spatial par graphe (2 couches, résiduelles)
-│   + LayerNorm + ELU   │
-└───────────┬───────────┘
-            ▼
-   Pooling (mean ‖ max ‖ std)   → embedding de graphe par pas de temps
-            ▼
-┌───────────────────────┐
-│   GRU bidirectionnel  │  → encodage temporel de la séquence d'embeddings
-│   (2 couches)         │
-└───────────┬───────────┘
-            ▼
-  Dernier état ‖ Attention temporelle
-            ▼
-        Fusion (MLP)
-            ▼
-     ┌──────┴──────┐
-     ▼             ▼
- Tête Service   Tête Panne
- (MLPHead)      (MLPHead)
-```
+![Architecture](model_architecture_with_layers.png)
 
 ### 1. `GATEncoder` — encodage spatial
 - Deux couches **GATv2Conv** (attention multi-têtes sur les arêtes, avec `edge_dim` pour intégrer les features de communication).
