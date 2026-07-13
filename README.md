@@ -1,152 +1,154 @@
-# RCA-GAT-GRU — Détection de service fautif et de type de panne par apprentissage sur graphes temporels
+# RCA-GAT-GRU — Faulty Service and Failure Type Detection via Temporal Graph Learning
 
-Système de **Root Cause Analysis (RCA)** pour environnements micro-services / Kubernetes, combinant un encodeur de graphes d'attention (**GATv2**) et un module temporel (**GRU bidirectionnel + attention**) pour identifier, à partir de séquences de graphes d'appels inter-services, **quel service est à l'origine d'un incident** et **quel type de panne** est en cours.
+**Root Cause Analysis (RCA)** system for microservices / Kubernetes environments, combining a graph attention encoder (**GATv2**) with a temporal module (**bidirectional GRU + attention**) to identify, from sequences of inter-service call graphs, **which service is the root cause of an incident** and **what type of failure** is occurring.
 
-Le modèle est multi-tâche : il produit simultanément une prédiction de **service fautif** et une prédiction de **classe de panne**, à partir d'une fenêtre glissante de graphes de communication/ressources/événements.
+The model is multi-task: it simultaneously produces a **faulty service** prediction and a **failure class** prediction, from a sliding window of communication/resource/event graphs.
 
 ---
 
-## Sommaire
+## Table of Contents
 
-- [Aperçu](#aperçu)
-- [Architecture du modèle](#architecture-du-modèle)
-- [Pipeline de données](#pipeline-de-données)
-- [Structure du dépôt](#structure-du-dépôt)
+- [Overview](#overview)
+- [Model Architecture](#model-architecture)
+- [Data Pipeline](#data-pipeline)
+- [Repository Structure](#repository-structure)
 - [Installation](#installation)
-- [Format des données d'entrée](#format-des-données-dentrée)
-- [Entraînement](#entraînement)
-- [Évaluation et inférence](#évaluation-et-inférence)
-- [Artefacts produits](#artefacts-produits)
-- [Configuration et hyperparamètres](#configuration-et-hyperparamètres)
+- [Input Data Format](#input-data-format)
+- [Training](#training)
+- [Evaluation and Inference](#evaluation-and-inference)
+- [Generated Artifacts](#generated-artifacts)
+- [Configuration and Hyperparameters](#configuration-and-hyperparameters)
+- [License](#license)
 
-- [Licence](#licence)
+---
+
+## Overview
+
+In a distributed system, an incident (abnormal latency, high error rate, throughput drop) often propagates from one service to its dependencies. This project models each **time window** of the infrastructure as a **graph**:
+
+- **nodes** = services (pods), with resource, event, and causality features,
+- **edges** = inter-service communications, with latency, throughput, error, and heuristically computed **causality score** features,
+- a **sequence of consecutive graphs** (sliding window) is then encoded over time to capture the dynamics of failure propagation.
+
+The final model answers two questions:
+
+1. **Which service is the root cause of the incident?** (multi-class classification `y1`)
+2. **What type of failure is occurring?** (multi-class classification `y2`)
 
 ---
 
-## Aperçu
+## Model Architecture
 
-Dans un système distribué, un incident (latence anormale, taux d'erreur élevé, chute de throughput) se propage souvent d'un service vers ses dépendances. Ce projet modélise chaque **fenêtre temporelle** de l'infrastructure comme un **graphe** :
+The model (`GATGRUMultiTask`, in [`model.py`](./model.py)) is organized into four blocks: spatial per-graph encoding (GATv2), aggregation into a graph embedding, temporal encoding (BiGRU + attention), and two dedicated output heads.
 
-- les **nœuds** = les services (pods), avec des features de ressources, d'événements et de causalité,
-- les **arêtes** = les communications inter-services, avec des features de latence, débit, erreurs et un **score de causalité** calculé heuristiquement,
-- une **séquence de graphes consécutifs** (fenêtre glissante) est ensuite encodée dans le temps pour capter la dynamique de propagation de la panne.
+![µS-RTKG + RCA model architecture](model_architecture_with_layers.png)
 
-Le modèle final répond à deux questions :
+*Figure — Full pipeline: communication logs, resource metrics, and Kubernetes events are assembled into a temporal sequence of graphs (RTKG snapshots `G_t`), enriched with causal node/edge features. Each graph is encoded by a 4-head `GATv2`, then aggregated via pooling (mean ‖ max ‖ std) before being passed to a `BiGRU`. A temporal attention layer summarizes the sequence, which finally feeds the two output heads (`Service Head`, `Failure Type Head`).*
 
-1. **Quel service est la cause racine de l'incident ?** (classification multi-classe `y1`)
-2. **Quel type de panne est en cours ?** (classification multi-classe `y2`)
+Summary schematic of the dimensions involved (example with `F_v = 17` features per node):
 
----
-## Architecture du modèle
-
-
-Le modèle (`GATGRUMultiTask`, dans [`model.py`](./model.py)) s'articule en quatre blocs : encodage spatial par graphe (GATv2), agrégation en embedding de graphe, encodage temporel (BiGRU + attention), puis deux têtes de sortie dédiées.
- 
-![Architecture du modèle µS-RTKG + RCA](model_architecture_with_layers.png)
- 
-*Figure — Pipeline complet : les logs de communication, métriques de ressources et événements Kubernetes sont assemblés en une séquence temporelle de graphes (RTKG snapshots `G_t`), enrichis de features causales sur les nœuds/arêtes. Chaque graphe est encodé par un `GATv2` à 4 têtes d'attention, puis agrégé par pooling (mean ‖ max ‖ std) avant d'être passé à un `BiGRU`. Une couche d'attention temporelle résume la séquence, qui alimente enfin les deux têtes de sortie (`Service Head`, `Failure Type Head`).*
- 
-Schéma synthétique des dimensions traversées (exemple avec `F_v = 17` features par nœud) :
- 
 ```
 input layer   →   GATv2 layers   →   BiGRU layer   →   attention layer   →   output heads
- (F_v = 17)        (4 têtes)          (564)              (256)            ŷ1 : 14 | ŷ2 : 5
+ (F_v = 17)        (4 heads)          (564)              (256)            ŷ1 : 14 | ŷ2 : 5
 ```
- 
-Détail séquentiel des blocs :
- 
+
+Sequential breakdown of the blocks:
+
 ```
-Séquence de graphes [G_t0, G_t1, ..., G_t(T-1)]
+Graph sequence [G_t0, G_t1, ..., G_t(T-1)]
         │
         ▼
 ┌───────────────────────┐
-│   GATEncoder (GATv2)  │  → encodage spatial par graphe (2 couches, résiduelles)
+│   GATEncoder (GATv2)  │  → spatial encoding per graph (2 layers, residual)
 │   + LayerNorm + ELU   │
 └───────────┬───────────┘
             ▼
-   Pooling (mean ‖ max ‖ std)   → embedding de graphe par pas de temps
+   Pooling (mean ‖ max ‖ std)   → graph embedding per time step
             ▼
 ┌───────────────────────┐
-│   GRU bidirectionnel  │  → encodage temporel de la séquence d'embeddings
-│   (2 couches)         │
+│  Bidirectional GRU    │  → temporal encoding of the embedding sequence
+│   (2 layers)          │
 └───────────┬───────────┘
             ▼
-  Dernier état ‖ Attention temporelle
+  Last hidden state ‖ Temporal attention
             ▼
         Fusion (MLP)
             ▼
      ┌──────┴──────┐
      ▼             ▼
- Tête Service   Tête Panne
+ Service Head   Failure Head
  (MLPHead)      (MLPHead)
 ```
- 
-### 1. `GATEncoder` — encodage spatial
-- Deux couches **GATv2Conv** (attention multi-têtes sur les arêtes, avec `edge_dim` pour intégrer les features de communication).
-- Connexions résiduelles + `LayerNorm` + `ELU` à chaque étage pour stabiliser l'entraînement sur des graphes de petite taille.
-- Une projection linéaire (`input_proj`) sert de raccourci résiduel dès la première couche.
-### 2. Pooling multi-statistique
-Pour chaque graphe, l'embedding global est obtenu par concaténation de trois agrégations sur les nœuds :
-- **moyenne** (`global_mean_pool`)
-- **maximum** (`global_max_pool`)
-- **écart-type** (implémentation batchée maison via `index_add_`, sans boucle Python)
-Cela permet de capter à la fois la tendance générale et la dispersion des anomalies entre services.
- 
-### 3. Module temporel — GRU + attention
-- Un **GRU bidirectionnel à 2 couches** encode la séquence d'embeddings de graphes.
-- Un module **`TemporalAttentionPooling`** calcule une pondération softmax sur les pas de temps (attention additive de type Bahdanau) pour produire un résumé contextuel de la séquence.
-- Le dernier état caché et le résumé attentionnel sont concaténés puis fusionnés par un MLP.
-### 4. Têtes de classification (`MLPHead`)
-Deux têtes indépendantes (service / panne), chacune un MLP à 2 couches cachées avec `LayerNorm`, `ReLU` et `Dropout`, partageant la même représentation fusionnée en entrée.
- 
----
 
-## Pipeline de données
+### 1. `GATEncoder` — spatial encoding
+- Two **GATv2Conv** layers (multi-head attention over edges, with `edge_dim` to incorporate communication features).
+- Residual connections + `LayerNorm` + `ELU` at each stage to stabilize training on small graphs.
+- A linear projection (`input_proj`) serves as a residual shortcut from the first layer onward.
 
-Le dataset (`RCAGraphSequenceDataset`, dans [`dataset2.py`](./dataset2.py)) transforme trois flux CSV bruts en séquences de graphes PyTorch Geometric (`torch_geometric.data.Data`).
+### 2. Multi-statistic pooling
+For each graph, the global embedding is obtained by concatenating three node-level aggregations:
+- **mean** (`global_mean_pool`)
+- **max** (`global_max_pool`)
+- **standard deviation** (custom batched implementation via `index_add_`, without a Python loop)
 
-**Étapes principales :**
+This captures both the general trend and the dispersion of anomalies across services.
 
-1. **Chargement et nettoyage** des trois fichiers sources (communication, ressources, événements), normalisation des noms de services.
-2. **Fenêtrage temporel** (`window_sec`) : agrégation des métriques par fenêtre de temps.
-3. **Features de deltas temporels** : calcul de variations (`delta_error`, `delta_latency`, `delta_throughput`, etc.) par service/paire de services au fil des fenêtres.
-4. **Score de causalité par arête** : un score heuristique composite est calculé pour chaque communication inter-service, combinant :
-   - la dégradation locale (erreur, latence, throughput),
-   - la position relative dans la fenêtre (rang, part de la pression causale),
-   - la persistance et l'accélération du signal dans le temps,
-   - un score de "chemin causal" agrégeant la propagation source → destination.
-5. **Construction des graphes** : un graphe par fenêtre temporelle, avec nœuds = services (features de ressources/événements/causalité) et arêtes = communications (features de communication/causalité). Les services sans communication reçoivent une auto-boucle par défaut pour rester connectés au graphe.
-6. **Normalisation** : `StandardScaler` (scikit-learn) ajusté sur le train, réutilisé tel quel en validation/test.
-7. **Séquençage** : regroupement des graphes en fenêtres glissantes de longueur `seq_len`, avec le label associé au **dernier pas de temps** de chaque séquence.
+### 3. Temporal module — GRU + attention
+- A **2-layer bidirectional GRU** encodes the sequence of graph embeddings.
+- A **`TemporalAttentionPooling`** module computes a softmax weighting over time steps (Bahdanau-style additive attention) to produce a contextual summary of the sequence.
+- The last hidden state and the attentional summary are concatenated and then merged by an MLP.
 
-Le dataset gère également la **cohérence des mappings** (`service_to_idx`, `failure_to_idx`) entre train et test, afin que les classes soient encodées de façon identique lors de l'inférence.
+### 4. Classification heads (`MLPHead`)
+Two independent heads (service / failure), each a 2-hidden-layer MLP with `LayerNorm`, `ReLU`, and `Dropout`, sharing the same fused representation as input.
 
 ---
 
-## Structure du dépôt
+## Data Pipeline
+
+The dataset (`RCAGraphSequenceDataset`, in [`dataset2.py`](./dataset2.py)) transforms three raw CSV streams into sequences of PyTorch Geometric graphs (`torch_geometric.data.Data`).
+
+**Main steps:**
+
+1. **Loading and cleaning** of the three source files (communication, resources, events), service name normalization.
+2. **Temporal windowing** (`window_sec`): metric aggregation per time window.
+3. **Temporal delta features**: computation of variations (`delta_error`, `delta_latency`, `delta_throughput`, etc.) per service/service pair across windows.
+4. **Per-edge causality score**: a composite heuristic score is computed for each inter-service communication, combining:
+   - local degradation (error, latency, throughput),
+   - relative position within the window (rank, share of causal pressure),
+   - persistence and acceleration of the signal over time,
+   - a "causal path" score aggregating source → destination propagation.
+5. **Graph construction**: one graph per time window, with nodes = services (resource/event/causality features) and edges = communications (communication/causality features). Services with no communication are given a default self-loop to remain connected to the graph.
+6. **Normalization**: `StandardScaler` (scikit-learn) fitted on the train set, reused as-is for validation/test.
+7. **Sequencing**: grouping graphs into sliding windows of length `seq_len`, with the label associated with the **last time step** of each sequence.
+
+The dataset also handles **mapping consistency** (`service_to_idx`, `failure_to_idx`) between train and test, so that classes are encoded identically at inference time.
+
+---
+
+## Repository Structure
 
 ```
 .
-├── model.py          # Architecture du modèle (GATEncoder, TemporalAttentionPooling, MLPHead, GATGRUMultiTask)
-├── dataset2.py        # Dataset PyG : construction des graphes séquentiels + features de causalité
-├── train.py           # Script d'entraînement (équilibrage de classes, AMP, checkpointing)
-├── top-k.py           # Script d'évaluation détaillée (accuracy, F1, top-k, matrices de confusion)
-├── tester_model/      # (attendu) CSV de validation/test au même format que l'entraînement
+├── model.py          # Model architecture (GATEncoder, TemporalAttentionPooling, MLPHead, GATGRUMultiTask)
+├── dataset2.py        # PyG Dataset: sequential graph construction + causality features
+├── train.py           # Training script (class balancing, AMP, checkpointing)
+├── top-k.py           # Detailed evaluation script (accuracy, F1, top-k, confusion matrices)
+├── tester_model/      # (expected) validation/test CSVs in the same format as training
 └── README.md
 ```
 
-> Les scripts s'attendent à trouver les fichiers CSV sources dans le répertoire courant du script (`aggregated_pod_communication.csv`, `aggregated_pod_resource_consumption.csv`, `aggregated_pod_events.csv`), et un sous-dossier `tester_model/` contenant les mêmes fichiers pour la validation/le test.
+> The scripts expect to find the source CSV files in the script's current directory (`aggregated_pod_communication.csv`, `aggregated_pod_resource_consumption.csv`, `aggregated_pod_events.csv`), and a `tester_model/` subfolder containing the same files for validation/testing.
 
 ---
 
 ## Installation
 
-### Prérequis
+### Requirements
 - Python ≥ 3.9
 - PyTorch ≥ 2.0
-- PyTorch Geometric (compatible avec la version de PyTorch/CUDA installée)
+- PyTorch Geometric (compatible with your installed PyTorch/CUDA version)
 
-### Dépendances
+### Dependencies
 
 ```bash
 pip install torch torchvision torchaudio
@@ -154,94 +156,91 @@ pip install torch_geometric
 pip install pandas numpy scikit-learn joblib
 ```
 
-> ⚠️ L'installation de `torch_geometric` dépend de votre version exacte de PyTorch et de CUDA. Suivez les instructions officielles : https://pytorch-geometric.readthedocs.io/en/latest/install/installation.html
+> ⚠️ Installing `torch_geometric` depends on your exact PyTorch and CUDA version. Follow the official instructions: https://pytorch-geometric.readthedocs.io/en/latest/install/installation.html
 
 ---
 
-## Format des données d'entrée
+## Input Data Format
 
-Trois fichiers CSV sont attendus en entrée, avec un timestamp de fenêtre (`window_ts`) commun :
+Three CSV files are expected as input, sharing a common window timestamp (`window_ts`):
 
-| Fichier | Contenu attendu |
+| File | Expected content |
 |---|---|
-| `aggregated_pod_communication.csv` | Communications entre services (source, destination, latence, débit, taux d'erreur, timestamp) |
-| `aggregated_pod_resource_consumption.csv` | Consommation de ressources par service (CPU, mémoire, etc., timestamp) |
-| `aggregated_pod_events.csv` | Événements Kubernetes/applicatifs par service (warnings, erreurs critiques, timestamp) |
+| `aggregated_pod_communication.csv` | Communications between services (source, destination, latency, throughput, error rate, timestamp) |
+| `aggregated_pod_resource_consumption.csv` | Resource consumption per service (CPU, memory, etc., timestamp) |
+| `aggregated_pod_events.csv` | Kubernetes/application events per service (warnings, critical errors, timestamp) |
 
-Les labels (`y1` = service fautif, `y2` = type de panne) sont dérivés en interne par le dataset à partir de ces flux (voir `_build_window_indices` / `label_lookup` dans `dataset2.py`).
+Labels (`y1` = faulty service, `y2` = failure type) are derived internally by the dataset from these streams (see `_build_window_indices` / `label_lookup` in `dataset2.py`).
 
 ---
 
-## Entraînement
+## Training
 
 ```bash
 python train.py
 ```
 
-Le script `train.py` réalise :
+The `train.py` script performs:
 
-1. **Chargement** du dataset d'entraînement avec ajustement des scalers (`fit_scaler=True`).
-2. **Sauvegarde des artefacts de prétraitement** (scalers + mappings de classes) pour garantir la reproductibilité en inférence.
-3. **Équilibrage des classes** sur `y1` (sous-échantillonnage plafonné à `MAX_PER_Y1` par classe) pour limiter le déséquilibre entre services.
-4. **Construction d'un jeu de validation stratifié** sur `y1`, à partir d'un dossier `tester_model/` séparé.
-5. **Pondération de la loss** par classe (`compute_class_weights_from_indices`) pour compenser les classes rares.
-6. **Entraînement mixed-precision (AMP)** si un GPU CUDA est disponible (bf16 si supporté, sinon fp16 avec `GradScaler`).
-7. **Sélection du meilleur checkpoint** sur le F1-macro de validation du service (avec la val_loss comme critère de départage).
+1. **Loading** the training dataset with scaler fitting (`fit_scaler=True`).
+2. **Saving preprocessing artifacts** (scalers + class mappings) to ensure reproducibility at inference time.
+3. **Class balancing** on `y1` (subsampling capped at `MAX_PER_Y1` per class) to limit imbalance across services.
+4. **Building a stratified validation set** on `y1`, from a separate `tester_model/` folder.
+5. **Loss weighting** per class (`compute_class_weights_from_indices`) to compensate for rare classes.
+6. **Mixed-precision training (AMP)** if a CUDA GPU is available (bf16 if supported, otherwise fp16 with `GradScaler`).
+7. **Best checkpoint selection** based on the validation service F1-macro (with val_loss as a tiebreaker).
 
-### Sorties de l'entraînement
-- `model_balanced_y1_batched.pt` — poids du meilleur modèle (`state_dict` seul)
-- `best_service_f1_checkpoint.pt` — checkpoint complet (modèle, optimiseur, scaler AMP, métriques, config)
-- `node_scaler.pkl`, `edge_scaler.pkl` — scalers scikit-learn
-- `service_to_idx.json`, `failure_to_idx.json` — mappings classe ↔ index
+### Training outputs
+- `model_balanced_y1_batched.pt` — best model weights (`state_dict` only)
+- `best_service_f1_checkpoint.pt` — full checkpoint (model, optimizer, AMP scaler, metrics, config)
+- `node_scaler.pkl`, `edge_scaler.pkl` — scikit-learn scalers
+- `service_to_idx.json`, `failure_to_idx.json` — class ↔ index mappings
 
-### Hyperparamètres principaux (`train.py`)
+### Main hyperparameters (`train.py`)
 
-| Paramètre | Valeur par défaut | Description |
+| Parameter | Default value | Description |
 |---|---|---|
-| `SEQ_LEN` | 5 | Longueur de la séquence de graphes |
-| `WINDOW_SEC` | 2 | Durée d'une fenêtre temporelle (s) |
-| `VAL_RATIO` | 0.2 | Proportion de validation par rapport au train équilibré |
-| `MAX_PER_Y1` | 700 | Plafond d'échantillons par classe de service (équilibrage) |
-| `BATCH_SIZE` | 64 | Taille de batch |
-| `SERVICE_LOSS_WEIGHT` | 2.5 | Pondération relative de la loss "service" vs "panne" |
-| `EPOCHS` | 250 | Nombre d'époques |
-| `SEED` | 42 | Graine aléatoire |
+| `SEQ_LEN` | 5 | Length of the graph sequence |
+| `WINDOW_SEC` | 2 | Duration of a time window (s) |
+| `VAL_RATIO` | 0.2 | Validation proportion relative to the balanced training set |
+| `MAX_PER_Y1` | 700 | Sample cap per service class (balancing) |
+| `BATCH_SIZE` | 64 | Batch size |
+| `SERVICE_LOSS_WEIGHT` | 2.5 | Relative weighting of the "service" loss vs. the "failure" loss |
+| `EPOCHS` | 250 | Number of epochs |
+| `SEED` | 42 | Random seed |
 
 ---
 
-## Évaluation et inférence
+## Evaluation and Inference
 
 ```bash
 python top-k.py
 ```
 
-Ce script recharge le modèle et les artefacts de prétraitement (scalers, mappings) sauvegardés à l'entraînement, puis évalue sur le jeu de test présent dans `tester_model/`.
+This script reloads the model and the preprocessing artifacts (scalers, mappings) saved during training, then evaluates on the test set present in `tester_model/`.
 
-**Métriques calculées :**
-- Accuracy et F1-macro pour chaque tâche (service, panne)
-- **Top-3 / Top-5 accuracy** (utile en RCA : proposer une shortlist de causes probables plutôt qu'une seule réponse)
-- Rapport de classification complet (`classification_report`) et matrices de confusion par tâche
-- Export détaillé par échantillon (probabilités, top-k, prédictions) dans `predictions_debug_batched.csv`
+**Computed metrics:**
+- Accuracy and F1-macro for each task (service, failure)
+- **Top-3 / Top-5 accuracy** (useful in RCA: proposing a shortlist of likely causes rather than a single answer)
+- Full classification report (`classification_report`) and confusion matrices per task
+- Detailed per-sample export (probabilities, top-k, predictions) in `predictions_debug_batched.csv`
 
-> Le chargement du checkpoint gère automatiquement la compatibilité `weights_only` introduite dans PyTorch 2.6+, avec repli sécurisé si nécessaire.
+> Checkpoint loading automatically handles the `weights_only` compatibility introduced in PyTorch 2.6+, with a safe fallback if needed.
 
 ---
 
-## Artefacts produits
+## Generated Artifacts
 
-| Fichier | Description |
+| File | Description |
 |---|---|
-| `best_service_f1_checkpoint.pt` | Checkpoint complet à utiliser pour l'inférence |
-| `model_balanced_y1_batched.pt` | Poids seuls du meilleur modèle |
-| `node_scaler.pkl` / `edge_scaler.pkl` | Normalisation à réappliquer sur toute nouvelle donnée |
-| `service_to_idx.json` / `failure_to_idx.json` | Mappings de classes, indispensables pour interpréter les prédictions |
-| `predictions_debug_batched.csv` | Prédictions détaillées avec top-k et probabilités |
+| `best_service_f1_checkpoint.pt` | Full checkpoint to use for inference |
+| `model_balanced_y1_batched.pt` | Best model weights only |
+| `node_scaler.pkl` / `edge_scaler.pkl` | Normalization to reapply to any new data |
+| `service_to_idx.json` / `failure_to_idx.json` | Class mappings, required to interpret predictions |
+| `predictions_debug_batched.csv` | Detailed predictions with top-k and probabilities |
 
 ---
 
-
-
-
-## Licence
+## License
 
 .....
